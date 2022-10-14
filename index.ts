@@ -1,38 +1,71 @@
 import { startStream, types } from 'near-lake-framework';
+import { EventHubProducerClient } from "@azure/event-hubs";
+const { BlobServiceClient } = require('@azure/storage-blob');
+import { promises as fs } from "fs";
+
+const AZURE_STORAGE_CONNECTION_STRING = 
+  process.env.AZURE_STORAGE_CONNECTION_STRING;
+const AZURE_EVENTHUB_CONNECTION_STRING = 
+  process.env.AZURE_EVENTHUB_CONNECTION_STRING;
+const WEBJOBS_SHUTDOWN_FILE =
+  process.env.WEBJOBS_SHUTDOWN_FILE;
+
+const shutDownRequested = async () => !!(await fs.stat(WEBJOBS_SHUTDOWN_FILE).catch(e => false));
+
+const producerClient = new EventHubProducerClient(AZURE_EVENTHUB_CONNECTION_STRING, "invoiceevent");
+const blobServiceClient = BlobServiceClient.fromConnectionString(
+  AZURE_STORAGE_CONNECTION_STRING
+);
+const containerClient = blobServiceClient.getContainerClient("nearcursor");
+const blockBlobClient = containerClient.getBlockBlobClient("cursor");
+const blobClient = containerClient.getBlobClient("cursor");
 
 const lakeConfig: types.LakeConfig = {
-  s3BucketName: "near-lake-data-mainnet",
+  s3BucketName: "near-lake-data-testnet",
   s3RegionName: "eu-central-1",
-  startBlockHeight: 66264389,
+  startBlockHeight: 102550527,
 };
+var cursor : number = lakeConfig.startBlockHeight;
 
-// Interface to capture data about an event
-// Arguments
-// * `standard`: name of standard, e.g. nep171
-// * `version`: e.g. 1.0.0
-// * `event`: type of the event, e.g. nft_mint
-// * `data`: associate event data. Strictly typed for each set {standard, version, event} inside corresponding NEP
-interface EventLogData {
+interface MicroInvoiceDto {
   standard: string,
   version: string,
   event: string,
-  data?: unknown,
+  data: MicroInvoiceDataDto[],
 };
 
-interface ParasEventLogData {
-  owner_id: string,
-  token_ids: string[],
-};
-
-interface MintbaseEventLogData {
-  owner_id: string,
-  memo: string,
+interface MicroInvoiceDataDto{
+  from: string,
+  to: string,
+  amount: string,
+  article: string,
+  currency: string
 }
+
+var handleStreamerMessageWithShutDown
+  = async (streamerMessage: types.StreamerMessage) => {
+    try{
+      await handleStreamerMessage(streamerMessage);
+    }
+    catch(ex)
+    {
+      console.log("Storing cursor at ", cursor);
+      var data = cursor.toString();
+      await blockBlobClient.upload(data, data.length);
+      console.log("Cursor stored");
+      throw ex;
+    }
+  };
 
 async function handleStreamerMessage(
   streamerMessage: types.StreamerMessage
 ): Promise<void> {
+  if (await shutDownRequested())
+  {
+    throw "Shut down requested";
+  }
   const createdOn = new Date(streamerMessage.block.header.timestamp / 1000000)
+  cursor = streamerMessage.block.header.height;
   const relevantOutcomes = streamerMessage
     .shards
     .flatMap(shard => shard.receiptExecutionOutcomes)
@@ -42,10 +75,11 @@ async function handleStreamerMessage(
         receiverId: outcome.receipt.receiverId,
       },
       events: outcome.executionOutcome.outcome.logs.map(
-        (log: string): EventLogData => {
+        (log: string): MicroInvoiceDto => {
           const [_, probablyEvent] = log.match(/^EVENT_JSON:(.*)$/) ?? []
           try {
-            return JSON.parse(probablyEvent)
+            var probableEvent = JSON.parse(probablyEvent);
+            return probableEvent;
           } catch (e) {
             return
           }
@@ -55,55 +89,78 @@ async function handleStreamerMessage(
     }))
     .filter(relevantOutcome =>
       relevantOutcome.events.some(
-        event => event.standard === "nep171" && event.event === "nft_mint"
+        event => event.standard === "tbx.1" && event.event === "issue_invoice"
       )
     )
 
   let output = []
-  for (let relevantOutcome of relevantOutcomes) {
-    let marketplace = "Unknown"
-    let nfts = []
-    if (relevantOutcome.receipt.receiverId.endsWith(".paras.near")) {
-      marketplace = "Paras"
-      nfts = relevantOutcome.events.flatMap(event => {
-        return (event.data as ParasEventLogData[])
-          .map(eventData => ({
-            owner: eventData.owner_id,
-            links: eventData.token_ids.map(
-              tokenId => `https://paras.id/token/${relevantOutcome.receipt.receiverId}::${tokenId.split(":")[0]}/${tokenId}`
-            )
-           })
-        )
-      })
-    } else if (relevantOutcome.receipt.receiverId.match(/\.mintbase\d+\.near$/)) {
-      marketplace = "Mintbase"
-      nfts = relevantOutcome.events.flatMap(event => {
-        return (event.data as MintbaseEventLogData[])
-          .map(eventData => {
-          const memo = JSON.parse(eventData.memo)
-          return {
-            owner: eventData.owner_id,
-            links: [`https://mintbase.io/thing/${memo["meta_id"]}:${relevantOutcome.receipt.receiverId}`]
-          }
-        })
-      })
-    } else {
-      nfts = relevantOutcome.events.flatMap(event => event.data)
-    }
-    output.push({
-      receiptId: relevantOutcome.receipt.id,
-      marketplace,
-      createdOn,
-      nfts,
-    })
-
+  for (let relevantOutcome of relevantOutcomes
+    .flatMap(outcome => outcome.events
+      .flatMap(e => e.data)
+      .map(eventData =>
+        ({
+          contract: outcome.receipt.receiverId,
+          from: eventData.from,
+          to : eventData.to,
+          article : eventData.article,
+          id : outcome.receipt.id,
+          amount : eventData.amount,
+          currency : eventData.currency
+        }))))
+  {
+    output.push(relevantOutcome)
   }
   if (output.length) {
-    console.log(`We caught freshly minted NFTs!`)
-    console.dir(output, { depth: 5 })
+    console.log(`We caught fresh invoices!`)    
+    const eventDataBatch = await producerClient.createBatch();
+    for (let invoice of output)
+    {
+      eventDataBatch.tryAdd({ body: invoice });
+    }
+    await producerClient.sendBatch(eventDataBatch);
   }
 }
 
 (async () => {
-  await startStream(lakeConfig, handleStreamerMessage);
-})();
+  
+  try{
+    const downloadBlockBlobResponse = await blobClient.download();
+    lakeConfig.startBlockHeight = Number((await streamToBuffer(downloadBlockBlobResponse.readableStreamBody)).toString());
+    console.log("Downloaded cursor with content:", lakeConfig.startBlockHeight);    
+  }
+  catch(ex)
+  {
+    if (ex.details.errorCode == "BlobNotFound")
+    {
+      console.log("No cursor found, using default");
+    }else{
+      throw ex;
+    }
+  }
+  try{
+    await startStream(lakeConfig, handleStreamerMessageWithShutDown);
+  }
+  catch(ex)
+  {
+    console.error(ex);
+    console.log("Storing cursor at ", cursor);
+    var data = cursor.toString();
+    await blockBlobClient.upload(data, data.length);
+    console.log("Cursor stored");
+  }
+  console.log(`Closing producer`)
+  await producerClient.close();
+})().catch( e => { console.error(e) });
+
+async function streamToBuffer(readableStream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    readableStream.on("data", (data) => {
+      chunks.push(data instanceof Buffer ? data : Buffer.from(data));
+    });
+    readableStream.on("end", () => {
+      resolve(Buffer.concat(chunks));
+    });
+    readableStream.on("error", reject);
+  });
+}
