@@ -3,12 +3,14 @@ import { EventHubProducerClient } from "@azure/event-hubs";
 const { BlobServiceClient } = require('@azure/storage-blob');
 import { promises as fs } from "fs";
 
-const AZURE_STORAGE_CONNECTION_STRING = 
+var AZURE_STORAGE_CONNECTION_STRING = 
   process.env.AZURE_STORAGE_CONNECTION_STRING;
-const AZURE_EVENTHUB_CONNECTION_STRING = 
+var AZURE_EVENTHUB_CONNECTION_STRING = 
   process.env.AZURE_EVENTHUB_CONNECTION_STRING;
-const WEBJOBS_SHUTDOWN_FILE =
+var WEBJOBS_SHUTDOWN_FILE =
   process.env.WEBJOBS_SHUTDOWN_FILE;
+
+var lastSnapshot = new Date();
 
 const shutDownRequested = async () => !!(await fs.stat(WEBJOBS_SHUTDOWN_FILE).catch(e => false));
 
@@ -35,6 +37,7 @@ interface MicroInvoiceDto {
 };
 
 interface MicroInvoiceDataDto{
+  id: bigint,
   from: string,
   to: string,
   amount: string,
@@ -63,6 +66,11 @@ async function handleStreamerMessage(
   if (await shutDownRequested())
   {
     throw "Shut down requested";
+  }
+  if (lastSnapshot < new Date(new Date().getTime() - 5 * 60000))
+  {
+    lastSnapshot = new Date();
+    await storeCursor();
   }
   const createdOn = new Date(streamerMessage.block.header.timestamp / 1000000)
   cursor = streamerMessage.block.header.height;
@@ -103,7 +111,8 @@ async function handleStreamerMessage(
           from: eventData.from,
           to : eventData.to,
           article : eventData.article,
-          id : outcome.receipt.id,
+          receiptId : outcome.receipt.id,
+          id : eventData.id,
           amount : eventData.amount,
           currency : eventData.currency
         }))))
@@ -143,14 +152,18 @@ async function handleStreamerMessage(
   catch(ex)
   {
     console.error(ex);
-    console.log("Storing cursor at ", cursor);
-    var data = cursor.toString();
-    await blockBlobClient.upload(data, data.length);
-    console.log("Cursor stored");
+    await storeCursor();
   }
   console.log(`Closing producer`)
   await producerClient.close();
 })().catch( e => { console.error(e) });
+
+async function storeCursor() {
+  console.log("Storing cursor at ", cursor);
+  var data = (cursor - 10).toString();
+  await blockBlobClient.upload(data, data.length);
+  console.log("Cursor stored");
+}
 
 async function streamToBuffer(readableStream) {
   return new Promise((resolve, reject) => {
