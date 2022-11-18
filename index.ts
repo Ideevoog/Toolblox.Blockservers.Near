@@ -97,7 +97,7 @@ async function handleStreamerMessage(
     }))
     .filter(relevantOutcome =>
       relevantOutcome.events.some(
-        event => event.standard === "tbx.1" && event.event === "issue_invoice"
+        event => event.standard === "ARC-1" && event.event === "issue_invoice"
       )
     )
 
